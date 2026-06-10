@@ -96,6 +96,7 @@ Add to the VPS backup routine:
 2. **`deploy` has no sudo — by design.** Anything needing root (apt, iptables, Node upgrades) goes through `ssh vps-root`. The NanoClaw installer's Node bootstrap hangs on a hidden sudo prompt — Node 22 + pnpm 10 are installed system-wide; keep them current via root.
 3. **`systemctl --user` over SSH** needs `XDG_RUNTIME_DIR=/run/user/$(id -u)` (lingering already enabled via `loginctl enable-linger deploy`).
 4. **tmux session `nanoclaw`** on the VPS was used for the interactive install; safe to kill (`tmux kill-session -t nanoclaw`) — the service does not depend on it.
+5. **Mount allowlist schema**: `blockedPatterns` is REQUIRED (use `[]` — built-in defaults always merge in). Without it the whole allowlist fails to load and all additional mounts are silently rejected — symptom: `Additional mount REJECTED` in `nanoclaw.error.log` and the agent's notes don't persist.
 
 ## Deferred / future (post-setup brainstorm material)
 
