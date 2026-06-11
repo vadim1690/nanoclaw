@@ -26,7 +26,7 @@ Secrets: **Anthropic** (`5436f0f4`), **Groq** (`6f8370e7-…`, `api.groq.com`, p
 Google (Flooka only — `secretMode=all` matches all connected Google apps):
 - **Gmail** (modify + readonly) — via MCP server `@gongrzhe/server-gmail-autoauth-mcp` baked into the agent image. Policy: **read + draft only**, never auto-send.
 - **Google Calendar** — via MCP server `@cocal/google-calendar-mcp` in the image.
-- **Google Tasks** + **YouTube** — **no MCP server**; reached by direct REST through the OneCLI gateway (e.g. `curl https://tasks.googleapis.com/...`, `https://www.googleapis.com/youtube/v3/...`). The gateway injects the OAuth token because the host matches a connected app. **Vault connection ≠ MCP server** — don't judge an agent's access by its `mcp_servers` list.
+- **Google Tasks** + **YouTube** + **Google Sheets** + **Google Docs** — **no MCP server**; reached by direct REST through the OneCLI gateway (e.g. `curl https://tasks.googleapis.com/...`, `https://www.googleapis.com/youtube/v3/...`, `https://sheets.googleapis.com/v4/...`, `https://docs.googleapis.com/v1/...`). The gateway injects the OAuth token because the host matches a connected app. **Vault connection ≠ MCP server** — don't judge an agent's access by its `mcp_servers` list. (Sheets/Docs connected 2026-06-11; ~20 more apps — Drive, Photos, GitHub, Notion, Jira, Resend… — are one-click-connectable in the dashboard and then reachable the same way.)
 
 **Voice transcription**: both agents transcribe Telegram voice notes via Groq Whisper (`whisper-large-v3`) — a plain `curl` to `api.groq.com/openai/v1/audio/transcriptions`, key injected by the gateway. Defined in each agent's `CLAUDE.local.md`.
 
@@ -38,7 +38,14 @@ Shared design baked into both:
 - **Telegram formatting contract** — Telegram uses *legacy* Markdown. Only `*bold*`, `_italic_`, `` `code` ``, `[links]`, `•` bullets, emoji pseudo-headers render. NO `##` headings, `**double bold**`, tables, `>` quotes (they show literally / break). Hebrew & English on separate lines (RTL/LTR scramble otherwise).
 - **Proactivity** — Flooka budget 3–5 self-initiated msgs/day; Rocky 2–3/day. Quiet hours 22:00–07:00. Prefer silent action + batching into the daily briefs. Self-throttle logs: Flooka `…/notes/flooka-ping-log.md`, Rocky `…/data/rocky-ping-log.md`.
 - **Cost discipline** — ≤1 web search per brief, tight outputs, reuse-don't-refetch, cheap tool calls, never loop on failures.
+- **Always close the loop** — every reply does the task, reads the bigger picture, and offers ONE useful suggestion/follow-up (in-reply, no extra ping — costs nothing extra).
 - **Rocky coaching** is evidence-based: no-log nudge fires once and auto-clears on log, streaks always paired with forgiveness, never moralizes food, scales support down when consistent.
+
+### Capabilities added 2026-06-11
+- **Agent-to-agent teamwork** — Flooka ↔ Rocky message each other via `<message to="rocky">` / `<message to="flooka">` (rows in `agent_destinations`, `target_type=agent`, local names `rocky`/`flooka`). Rocky has no calendar of its own, so it routes gym/shopping/scheduling requests to Flooka. Add/inspect with `ncl destinations add/list`.
+- **Flooka second brain / CRM** — maintains `…/notes/people/<name>.md` (preps Vadim before meetings), `journal.md` (decisions/ideas), `projects.md`. Compounds over time.
+- **Flooka web browser** — `agent-browser` (in the image) for no-API tasks (price/stock watch, package tracking, lookups, booking). **Confirmed working under egress lockdown** — the OneCLI gateway passes through arbitrary HTTPS, so the browser reaches any site while the gateway remains the only egress. Token-heavy → gated to explicit asks; always confirms before booking/buying/submitting.
+- **Sheets/Docs** — Flooka logs structured data (expenses/habits) to Sheets and drafts/edits Docs via the gateway REST.
 
 ## Service management (over SSH)
 
