@@ -25,6 +25,8 @@ ARG VERCEL_VERSION=52.2.1
 ARG BUN_VERSION=1.3.12
 ARG GMAIL_MCP_VERSION=1.1.11
 ARG CALENDAR_MCP_VERSION=2.6.1
+# GitHub CLI — used by the dev agent (Cody) for repo/PR/Actions operations.
+ARG GH_VERSION=2.95.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -58,12 +60,32 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
        fi \
     && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI (gh) — not in Debian repos; install the pinned official release
+# binary. Used by the dev agent for repo create / PR / Actions operations
+# (gateway injects the GitHub token on api.github.com).
+RUN curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" -o /tmp/gh.tar.gz \
+    && tar -xzf /tmp/gh.tar.gz -C /tmp \
+    && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_amd64" \
+    && gh --version
+
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Belt-and-braces: prevent Playwright's postinstall from downloading its own
 # ~300MB Chromium. We've already installed the system one above.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# Make git and gh work behind the OneCLI TLS-intercepting gateway proxy. The
+# gateway sets SSL_CERT_FILE (curl) and NODE_EXTRA_CA_CERTS (node) at runtime,
+# but git reads neither and gh won't call the API without a token present.
+# Point git at the same combined CA the gateway writes (stable onecli path,
+# mirrors SSL_CERT_FILE), and give gh a non-empty placeholder — the gateway
+# injects the real PAT for GitHub-scoped agents; others get no injection and
+# fail closed. Must be image ENV: container-runner overrides the entrypoint
+# (--entrypoint bash -c 'exec bun ...'), so entrypoint.sh exports never run.
+ENV GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem
+ENV GH_TOKEN=onecli-gateway
 
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move

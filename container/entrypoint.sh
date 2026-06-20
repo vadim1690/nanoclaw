@@ -11,6 +11,15 @@
 
 set -e
 
+# OneCLI gateway is a TLS-intercepting proxy. It exports SSL_CERT_FILE (curl) and
+# NODE_EXTRA_CA_CERTS (node) so those trust the intercept CA — but git reads
+# neither, and gh won't call the API without a token present. Point git at the
+# same combined CA, and give gh a non-empty placeholder token (the gateway
+# injects the real PAT for agents scoped to GitHub; agents without that scope
+# simply get no injection and gh fails closed). Harmless for non-git agents.
+export GIT_SSL_CAINFO="${SSL_CERT_FILE:-/tmp/onecli-combined-ca.pem}"
+export GH_TOKEN="${GH_TOKEN:-onecli-gateway}"
+
 cat > /tmp/input.json
 
 exec bun run /app/src/index.ts < /tmp/input.json
