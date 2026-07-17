@@ -46,3 +46,6 @@ AGENTS.md
 docs/maintainer-guide.md
 docs/drafts/
 forks.md
+
+# Install-specific runbook — kept on the VPS only
+OPERATIONS.md
