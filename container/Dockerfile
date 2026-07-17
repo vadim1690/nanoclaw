@@ -144,6 +144,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
     chmod +x /usr/local/bin/ncl
 
+# ---- Agent output ceiling ----------------------------------------------------
+# Uncap per-turn output: Claude Code defaults to 32K when this is unset
+# (upstream issue #3023), silently truncating long turns. Opus 4.8 supports
+# 128K output/turn — raise the ceiling to the model max. It's a cap, not a
+# target; agents self-moderate and the SDK streams for large max_tokens.
+ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
