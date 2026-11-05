@@ -12,5 +12,9 @@
   {
     "name": "@firecrawl/anydoc",
     "version": "0.1.6"
+  },
+  {
+    "name": "mcp-remote",
+    "version": "0.1.38"
   }
 ]
