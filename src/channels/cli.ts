@@ -13,10 +13,13 @@
  *     { "text": "user message" }                          # default — talk to cli/local
  *     { "text": "...", "to": {"channelType": "discord",
  *                             "platformId": "discord:@me:149...",
- *                             "threadId": null} }         # route to a specific mg
+ *                             "threadId": null,
+ *                             "instance": "discord"} }    # route to a specific mg
+ *                                                         # (instance optional; default = channelType)
  *     { "text": "...", "to": {...}, "reply_to": {...} }   # + redirect replies
  *   Server → client:
  *     { "text": "agent reply" }
+ *     { "text": "...", "failureNotice": true }            # the agent run failed
  *
  * The `to` and `reply_to` addressing is how admin transports (the bootstrap
  * script) inject messages targeting any wired channel. `reply_to` is a
@@ -39,10 +42,33 @@ import path from 'path';
 
 import { DATA_DIR } from '../config.js';
 import { log } from '../log.js';
-import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
-import { registerChannelAdapter } from './channel-registry.js';
+import type {
+  ChannelAdapter,
+  ChannelDefaults,
+  ChannelSetup,
+  DeliveryAddress,
+  InboundEvent,
+  OutboundMessage,
+} from './adapter.js';
+import { INSTANCE_KEY_RE, registerChannelAdapter } from './channel-registry.js';
 
 const PLATFORM_ID = 'local';
+
+// Copy of the runner's FAILURE_NOTICE_FIELD (container/agent-runner/src/formatter.ts);
+// cli.test.ts pins it to that and to scripts/chat.ts so a rename fails a test.
+export const FAILURE_NOTICE_FIELD = 'failureNotice';
+
+/**
+ * Terminal transport: every line the operator types is for the agent
+ * (pattern '.'), the socket is owner-only so senders are trusted ('public'),
+ * there is no thread or mention concept. Matches what
+ * scripts/init-cli-agent.ts has always created.
+ */
+const CLI_DEFAULTS: ChannelDefaults = {
+  dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
+  group: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
+  mentions: 'never',
+};
 
 function socketPath(): string {
   return path.join(DATA_DIR, 'cli.sock');
@@ -56,6 +82,7 @@ function createAdapter(): ChannelAdapter {
     name: 'cli',
     channelType: 'cli',
     supportsThreads: false,
+    defaults: CLI_DEFAULTS,
 
     async setup(config: ChannelSetup): Promise<void> {
       const sock = socketPath();
@@ -126,8 +153,11 @@ function createAdapter(): ChannelAdapter {
       }
       const text = extractText(message);
       if (text === null) return undefined;
+      // Forward the runner's failure flag so clients (the setup ping) can tell
+      // a failed run from a real reply without matching notice text.
+      const failureNotice = isFailureNotice(message) || undefined;
       try {
-        client.write(JSON.stringify({ text }) + '\n');
+        client.write(JSON.stringify({ text, [FAILURE_NOTICE_FIELD]: failureNotice }) + '\n');
       } catch (err) {
         log.warn('Failed to write to CLI client', { err });
       }
@@ -188,7 +218,7 @@ function createAdapter(): ChannelAdapter {
     };
     try {
       payload = JSON.parse(line);
-    } catch (err) {
+    } catch (_err) {
       log.warn('CLI: ignoring non-JSON line from client', { line });
       return;
     }
@@ -203,6 +233,7 @@ function createAdapter(): ChannelAdapter {
       // Does NOT claim the chat slot, so an active terminal chat isn't evicted.
       const event: InboundEvent = {
         channelType: to.channelType,
+        instance: to.instance,
         platformId: to.platformId,
         threadId: to.threadId,
         message: {
@@ -244,7 +275,7 @@ function createAdapter(): ChannelAdapter {
     }
   }
 
-  function parseAddress(raw: unknown): DeliveryAddress | null {
+  function parseAddress(raw: unknown): (DeliveryAddress & { instance?: string }) | null {
     if (!raw || typeof raw !== 'object') return null;
     const obj = raw as Record<string, unknown>;
     if (typeof obj.channelType !== 'string' || typeof obj.platformId !== 'string') return null;
@@ -254,10 +285,21 @@ function createAdapter(): ChannelAdapter {
         : typeof obj.threadId === 'string'
           ? obj.threadId
           : null;
+    // Anything that is not a registry key resolves as the default instance;
+    // fail closed, but loudly, so a typo in `to.instance` is visible in the log.
+    let instance: string | undefined;
+    if (typeof obj.instance === 'string') {
+      if (INSTANCE_KEY_RE.test(obj.instance)) {
+        instance = obj.instance;
+      } else {
+        log.warn('CLI: ignoring non-URL-safe to.instance, routing to the default instance', { instance: obj.instance });
+      }
+    }
     return {
       channelType: obj.channelType,
       platformId: obj.platformId,
       threadId,
+      instance,
     };
   }
 
@@ -273,4 +315,9 @@ function extractText(message: OutboundMessage): string | null {
   return null;
 }
 
-registerChannelAdapter('cli', { factory: createAdapter });
+function isFailureNotice(message: OutboundMessage): boolean {
+  const content = message.content as Record<string, unknown> | undefined;
+  return typeof content === 'object' && content !== null && content[FAILURE_NOTICE_FIELD] === true;
+}
+
+registerChannelAdapter('cli', { factory: createAdapter, defaults: CLI_DEFAULTS });

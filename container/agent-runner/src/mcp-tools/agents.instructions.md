@@ -4,7 +4,7 @@
 
 ### How it works
 
-- Creates a new agent with its own container, workspace, and session. Your `instructions` string seeds the agent's `CLAUDE.local.md` — its starting role and personality.
+- Creates a new agent with its own container, workspace, and session. Your `instructions` string becomes its `instructions.prepend.md` — its standing role and personality.
 - The agent's `name` becomes a destination on both sides: you address it via `send_message({ to: "<name>", ... })`, and its replies arrive as inbound messages with `from="<name>"`.
 - Each agent has its own persistent workspace under `groups/<folder>/` — memory, conversation history, and notes all survive across sessions. This is a full standalone agent, not a stateless sub-query.
 - **Fire-and-forget:** the call returns immediately without waiting for the agent to confirm it's ready. Messages you send will queue until it's up.
@@ -20,6 +20,13 @@ The right frame is: does this agent need its own memory and context that builds 
 
 - **One-off lookups or short tasks** — use the SDK `Agent` tool instead. It's stateless, spins up and completes in one shot, and leaves no persistent footprint.
 - **Work that finishes before the user's next message** — agents persist indefinitely. Don't create one for something you could do inline.
+
+### Templates
+
+- If relevant, you can offer to create an agent from a predefined template.
+- If the user shows interest: `ncl templates list` (templates on this machine), then `ncl templates list --registry` for the public library.
+- Use a template only once the user has picked it. Pass the chosen ref as `template: "sales/sdr"`.
+- A template supplies the persona: `instructions` passed alongside `template` are **ignored**.
 
 ### Writing good `instructions`
 

@@ -1,34 +1,40 @@
 /**
- * `create_agent` delivery-action handler.
+ * `create_agent` delivery-action bodies.
  *
  * SECURITY: `create_agent` writes to the CENTRAL DB (agent_groups,
  * container_configs, agent_destinations) and scaffolds host filesystem state —
  * a privileged operation a confined container is otherwise architecturally
  * barred from. The container's MCP tool gate is inside the (untrusted)
  * container and is trivially bypassed by writing the outbound system row
- * directly, so authorization MUST be enforced host-side. Trusted owner agent
- * groups (CLI scope 'global') create directly; every other (confined) group
- * requires admin approval via `requestApproval` — matching `ncl groups create`
- * (access: 'approval') and the self-mod actions. `applyCreateAgent` runs the
- * creation on approve; `performCreateAgent` is the shared body.
+ * directly, so authorization MUST be enforced host-side: the delivery
+ * registry wraps this action with the guard, whose `agents.create` decision
+ * (./guard.ts) is the old cli_scope branch verbatim — trusted global-scope
+ * groups allow, everything else (including unknown config, fail-closed)
+ * holds for admin approval. On approve the continuation re-enters the
+ * wrapped action with the approval row as its grant and `createAgent` runs.
+ * `performCreateAgent` is the module-private body for a plain create; a
+ * request with a `template` ref is stamped from that template instead, under
+ * the same authorization (the grant is bound to the ref, ./guard.ts).
  */
-import path from 'path';
-
-import { GROUPS_DIR } from '../../config.js';
-import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { quoteForCard } from '../../card-text.js';
+import { createAgentGroup, getAgentGroup } from '../../db/agent-groups.js';
+import { getContainerConfig } from '../../db/container-configs.js';
 import { getSession } from '../../db/sessions.js';
-import { wakeContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
+import { assertValidGroupFolder, newGroupFolder } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
+import { createAgentFromTemplate, templateFolder } from '../../templates/create-agent.js';
+import { isValidTemplateRef } from '../../templates/local-dir.js';
+import { ensureTemplateLocal, hasLocalTemplate } from '../../templates/library.js';
 import type { AgentGroup, Session } from '../../types.js';
-import { requestApproval, type ApprovalHandler } from '../approvals/index.js';
+import { requestApproval } from '../approvals/index.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
 
-function notifyAgent(session: Session, text: string): void {
-  writeSessionMessage(session.agent_group_id, session.id, {
+async function notifyAgent(session: Session, text: string): Promise<void> {
+  await writeSessionMessage(session.agent_group_id, session.id, {
     id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
     timestamp: new Date().toISOString(),
@@ -37,120 +43,228 @@ function notifyAgent(session: Session, text: string): void {
     threadId: null,
     content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
   });
-  const fresh = getSession(session.id);
-  if (fresh) {
-    wakeContainer(fresh).catch((err) => log.error('Failed to wake container after notification', { err }));
+  const fresh = await getSession(session.id);
+  if (fresh) await requestWake(fresh, 'agent-created');
+}
+
+function templateRef(content: Record<string, unknown>): string | undefined {
+  return typeof content.template === 'string' && content.template ? content.template : undefined;
+}
+
+/** Guard precheck: malformed requests are answered without ever creating a hold. */
+export async function validateCreateAgent(content: Record<string, unknown>, session: Session): Promise<boolean> {
+  const name = typeof content.name === 'string' ? content.name : '';
+  if (!name) {
+    await notifyAgent(session, 'create_agent failed: name is required.');
+    return false;
+  }
+  if (
+    content.template !== undefined &&
+    !(typeof content.template === 'string' && isValidTemplateRef(content.template))
+  ) {
+    await notifyAgent(
+      session,
+      `create_agent failed: "${String(content.template)}" is not a template ref. Refs look like "sales/sdr"; list them with \`ncl templates list\`.`,
+    );
+    return false;
+  }
+  if (!(await getAgentGroup(session.agent_group_id))) {
+    await notifyAgent(session, 'create_agent failed: source agent group not found.');
+    log.warn('create_agent failed: missing source group', { sessionAgentGroup: session.agent_group_id, name });
+    return false;
+  }
+  const base = normalizeName(name);
+  // A name the requester already has makes no folder: createAgent answers it as a collision, or a
+  // wrapper resumes that agent (slack-agent-flow's parked app), so only a new name's folder is checked.
+  if (await getDestinationByName(session.agent_group_id, base)) return true;
+  // Only what the name alone decides, so no admin is carded for it. Whether another group holds the
+  // folder is not a confined agent's to learn before approval; the create refuses a taken one.
+  const notify = (text: string): Promise<void> => notifyAgent(session, text);
+  return (
+    (await folderFor(name, notify, () => {
+      assertValidGroupFolder(base);
+      return base;
+    })) !== null
+  );
+}
+
+/** The folder `pick` returns, or null once the requester is told why `name` can't have one. */
+async function folderFor(
+  name: string,
+  notify: (text: string) => Promise<void>,
+  pick: () => string | Promise<string>,
+): Promise<string | null> {
+  try {
+    return await pick();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await notify(`Cannot create agent "${name}": ${msg}. Nothing was created.`);
+    log.warn('create_agent refused: invalid folder', { name, err: msg });
+    return null;
   }
 }
 
 /**
- * Delivery-action entry.
- *
- * Authorization depends on the calling group's CLI scope:
- *   - `global` (set by init-first-agent for trusted owner agent groups):
- *     create immediately. create_agent is the intended primitive for these
- *     privileged agents, and an approval tap on every sub-agent spawn would be
- *     needless friction.
- *   - anything else (the default `group` scope — the realistic
- *     prompt-injection victim): require an admin to approve before any
- *     central-DB write. `applyCreateAgent` runs on approve.
- * Unknown/missing config fails closed to the approval path.
+ * The payload every create_agent hold stores. The approved replay runs with it
+ * as its content, so it must carry the template; a templated hold stores no
+ * instructions because the template replaces them. Wrappers (slack-agent-flow)
+ * add their own fields on top.
  */
-export async function handleCreateAgent(content: Record<string, unknown>, session: Session): Promise<void> {
+export function createAgentHoldPayload(content: Record<string, unknown>): Record<string, unknown> {
   const name = typeof content.name === 'string' ? content.name : '';
-  const instructions = typeof content.instructions === 'string' ? content.instructions : null;
+  const template = templateRef(content);
+  if (template) return { name, instructions: null, template };
+  return { name, instructions: typeof content.instructions === 'string' ? content.instructions : null };
+}
 
-  if (!name) {
-    notifyAgent(session, 'create_agent failed: name is required.');
-    return;
-  }
+/** The approval card's template sentence: which template, and whether approving downloads it. */
+export function templateApprovalNote(content: Record<string, unknown>): string {
+  const template = templateRef(content);
+  if (!template) return '';
+  const source = hasLocalTemplate(template) ? 'already on this machine' : 'downloaded from the public template library';
+  return ` It will be built from the template "${template}" (${source}).`;
+}
 
-  const sourceGroup = getAgentGroup(session.agent_group_id);
-  if (!sourceGroup) {
-    notifyAgent(session, 'create_agent failed: source agent group not found.');
-    log.warn('create_agent failed: missing source group', { sessionAgentGroup: session.agent_group_id, name });
-    return;
-  }
-
-  const cliScope = getContainerConfig(session.agent_group_id)?.cli_scope ?? 'group';
-  if (cliScope === 'global') {
-    // Trusted owner agent group — create directly, then notify (+wake) it.
-    await performCreateAgent(name, instructions, session, sourceGroup, (text) => notifyAgent(session, text));
-    return;
-  }
+/** Guard hold: card the requesting group's admin chain. */
+export async function requestCreateAgentHold(content: Record<string, unknown>, session: Session): Promise<void> {
+  const name = typeof content.name === 'string' ? content.name : '';
+  const sourceGroup = await getAgentGroup(session.agent_group_id);
+  if (!sourceGroup) return;
 
   await requestApproval({
     session,
     agentName: sourceGroup.name,
     action: 'create_agent',
-    payload: { name, instructions },
-    title: `Create agent: ${name}`,
-    question: `Agent "${sourceGroup.name}" wants to create a new sub-agent "${name}" (a new agent group with its own workspace and container). Approve?`,
+    payload: createAgentHoldPayload(content),
+    title: `Create agent: ${quoteForCard(name)}`,
+    question: `Agent ${quoteForCard(sourceGroup.name)} wants to create a new sub-agent ${quoteForCard(name)} (a new agent group with its own workspace and container).${templateApprovalNote(content)} Approve?`,
+  });
+}
+
+export interface CreateAgentOptions {
+  /**
+   * Suppress the terminal `Agent "<name>" created…` success notify. Error
+   * notifies (collision, invalid folder) still fire. For wrappers whose own
+   * completion text is the requester's only "done" signal — e.g.
+   * slack-agent-flow, where Slack provisioning runs AFTER this returns and
+   * relaying the upstream text would report "done" ~a minute early.
+   */
+  suppressCreatedNotify?: boolean;
+}
+
+/** Guard allow body: performs the creation (fresh global-scope call or approved replay). */
+export async function createAgent(
+  content: Record<string, unknown>,
+  session: Session,
+  options?: CreateAgentOptions,
+): Promise<void> {
+  const name = typeof content.name === 'string' ? content.name : '';
+  const instructions = typeof content.instructions === 'string' ? content.instructions : null;
+  const template = templateRef(content);
+  const sourceGroup = await getAgentGroup(session.agent_group_id);
+  if (!name || !sourceGroup) return; // precheck already answered the requester
+
+  const notify = (text: string): Promise<void> => notifyAgent(session, text);
+  const localName = normalizeName(name);
+  // Collision in the creator's destination namespace
+  if (await getDestinationByName(sourceGroup.id, localName)) {
+    await notify(`Cannot create agent "${name}": you already have a destination named "${localName}".`);
+    return;
+  }
+
+  // Subagent path: a child inherits its creator's EFFECTIVE provider, NOT the
+  // instance-wide default — so a child is never spawned on a runtime the parent
+  // can't reach (e.g. a codex-only install where claude isn't authenticated).
+  // A NULL parent resolves to claude. The operator can still flip a child
+  // later with `ncl groups config update --provider`.
+  const parentProvider = (await getContainerConfig(sourceGroup.id))?.provider ?? 'claude';
+
+  if (template) {
+    await createFromTemplate(template, name, localName, parentProvider, session, sourceGroup, notify, options);
+  } else {
+    await performCreateAgent(name, localName, instructions, parentProvider, session, sourceGroup, notify, options);
+  }
+}
+
+/**
+ * Template branch: check the folder, fetch, then stamp. The fetch comes before
+ * any DB write, so a failed download leaves nothing behind. Same authorization
+ * caveat as performCreateAgent.
+ */
+async function createFromTemplate(
+  template: string,
+  name: string,
+  localName: string,
+  parentProvider: string,
+  session: Session,
+  sourceGroup: AgentGroup,
+  notify: (text: string) => Promise<void>,
+  options?: CreateAgentOptions,
+): Promise<void> {
+  // Occupancy is checked here, after authorization, and before the fetch; the stamp checks again.
+  if (!(await folderFor(name, notify, () => templateFolder(name)))) return;
+
+  let fetched: boolean;
+  let commit: string | undefined;
+  try {
+    ({ fetched, commit } = await ensureTemplateLocal(template));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await notify(`Cannot create agent "${name}" from template "${template}": ${msg}. Nothing was created.`);
+    log.warn('create_agent template fetch failed', { template, err });
+    return;
+  }
+
+  let stamped: Awaited<ReturnType<typeof createAgentFromTemplate>>;
+  try {
+    stamped = await createAgentFromTemplate(template, { name, provider: parentProvider });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await notify(`Cannot create agent "${name}": template "${template}" could not be applied: ${msg}.`);
+    log.error('create_agent template stamp failed', { template, err });
+    return;
+  }
+
+  await wireNewAgent(sourceGroup.id, localName, stamped.group.id, session);
+
+  if (!options?.suppressCreatedNotify) {
+    const notices = stamped.report.length > 0 ? `\n${stamped.report.join('\n')}` : '';
+    await notify(
+      `Agent "${localName}" created from template "${template}". You can now message it with send_message({ to: "${localName}", ... }).${notices}`,
+    );
+  }
+  log.info('Agent group created from template', {
+    agentGroupId: stamped.group.id,
+    name,
+    localName,
+    template,
+    fetched,
+    commit,
+    parent: sourceGroup.id,
   });
 }
 
 /**
- * Approval handler: performs the creation once an admin approves a request from
- * a confined (non-global) agent group. `session` is the requesting parent.
- */
-export const applyCreateAgent: ApprovalHandler = async ({ session, payload, notify }) => {
-  const name = typeof payload.name === 'string' ? payload.name : '';
-  const instructions = typeof payload.instructions === 'string' ? payload.instructions : null;
-
-  if (!name) {
-    notify('create_agent approved but the request had no name.');
-    return;
-  }
-
-  const sourceGroup = getAgentGroup(session.agent_group_id);
-  if (!sourceGroup) {
-    notify('create_agent approved but the source agent group no longer exists.');
-    log.warn('create_agent apply failed: missing source group', { sessionAgentGroup: session.agent_group_id, name });
-    return;
-  }
-
-  await performCreateAgent(name, instructions, session, sourceGroup, notify);
-};
-
-/**
  * Core creation: writes the new agent group + bidirectional destinations and
  * scaffolds its filesystem, then reports via `notify`. Authorization is the
- * CALLER's responsibility (the global-scope shortcut in handleCreateAgent or
- * admin approval via applyCreateAgent) — never call this from an unauthorized
- * path, as it performs privileged central-DB writes a confined container is
+ * CALLER's responsibility (the guard's agents.create decision) — never call
+ * this from an unauthorized path, as it performs privileged central-DB
+ * writes a confined container is
  * otherwise barred from.
  */
 async function performCreateAgent(
   name: string,
+  localName: string,
   instructions: string | null,
+  parentProvider: string,
   session: Session,
   sourceGroup: AgentGroup,
-  notify: (text: string) => void,
+  notify: (text: string) => Promise<void>,
+  options?: CreateAgentOptions,
 ): Promise<void> {
-  const localName = normalizeName(name);
-
-  // Collision in the creator's destination namespace
-  if (getDestinationByName(sourceGroup.id, localName)) {
-    notify(`Cannot create agent "${name}": you already have a destination named "${localName}".`);
-    return;
-  }
-
-  // Derive a safe folder name, deduplicated globally across agent_groups.folder
-  let folder = localName;
-  let suffix = 2;
-  while (getAgentGroupByFolder(folder)) {
-    folder = `${localName}-${suffix}`;
-    suffix++;
-  }
-
-  const groupPath = path.join(GROUPS_DIR, folder);
-  const resolvedPath = path.resolve(groupPath);
-  const resolvedGroupsDir = path.resolve(GROUPS_DIR);
-  if (!resolvedPath.startsWith(resolvedGroupsDir + path.sep)) {
-    notify(`Cannot create agent "${name}": invalid folder path.`);
-    log.error('create_agent path traversal attempt', { folder, resolvedPath });
-    return;
-  }
+  // Occupancy is checked here, after authorization: the precheck only judged the name.
+  const folder = await folderFor(name, notify, () => newGroupFolder(localName));
+  if (!folder) return;
 
   const agentGroupId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const now = new Date().toISOString();
@@ -162,23 +276,31 @@ async function performCreateAgent(
     agent_provider: null,
     created_at: now,
   };
-  createAgentGroup(newGroup);
-  // A subagent inherits its creator's provider. Provider is a DB property; the
-  // child is created provider-agnostic, then stamped with the parent's runtime
-  // so a single-provider install (e.g. codex-only, where claude isn't
-  // authenticated) doesn't spawn a child on a runtime it can't reach. The
-  // operator can still flip a child later with `ncl groups config update
-  // --provider`. claude (the built-in default) leaves the column unset.
-  const parentProvider = getContainerConfig(sourceGroup.id)?.provider ?? undefined;
-  initGroupFilesystem(newGroup, { instructions: instructions ?? undefined, provider: parentProvider });
-  if (parentProvider) {
-    updateContainerConfigScalars(newGroup.id, { provider: parentProvider });
-  }
+  await createAgentGroup(newGroup);
+  // Passing the provider pins the child's scaffold and stamps its config row in one step.
+  await initGroupFilesystem(newGroup, { instructions: instructions ?? undefined, provider: parentProvider });
+  await wireNewAgent(sourceGroup.id, localName, agentGroupId, session);
 
+  if (!options?.suppressCreatedNotify) {
+    await notify(
+      `Agent "${localName}" created. You can now message it with send_message({ to: "${localName}", ... }).`,
+    );
+  }
+  log.info('Agent group created', { agentGroupId, name, localName, folder, parent: sourceGroup.id });
+}
+
+/** Wire a new child into its creator's messaging, for both kinds of create. */
+async function wireNewAgent(
+  sourceGroupId: string,
+  localName: string,
+  agentGroupId: string,
+  session: Session,
+): Promise<void> {
+  const now = new Date().toISOString();
   // Insert bidirectional destination rows (= ACL grants).
   // Creator refers to child by the name it chose; child refers to creator as "parent".
-  createDestination({
-    agent_group_id: sourceGroup.id,
+  await createDestination({
+    agent_group_id: sourceGroupId,
     local_name: localName,
     target_type: 'agent',
     target_id: agentGroupId,
@@ -188,15 +310,15 @@ async function performCreateAgent(
   // (shouldn't happen for a brand-new agent, but be safe).
   let parentName = 'parent';
   let parentSuffix = 2;
-  while (getDestinationByName(agentGroupId, parentName)) {
+  while (await getDestinationByName(agentGroupId, parentName)) {
     parentName = `parent-${parentSuffix}`;
     parentSuffix++;
   }
-  createDestination({
+  await createDestination({
     agent_group_id: agentGroupId,
     local_name: parentName,
     target_type: 'agent',
-    target_id: sourceGroup.id,
+    target_id: sourceGroupId,
     created_at: now,
   });
 
@@ -204,8 +326,5 @@ async function performCreateAgent(
   // inbound.db. See the top-of-file invariant in db/agent-destinations.ts
   // — forgetting this causes "dropped: unknown destination" when the parent
   // tries to send to the newly-created child.
-  writeDestinations(session.agent_group_id, session.id);
-
-  notify(`Agent "${localName}" created. You can now message it with <message to="${localName}">...</message>.`);
-  log.info('Agent group created', { agentGroupId, name, localName, folder, parent: sourceGroup.id });
+  await writeDestinations(session.agent_group_id, session.id);
 }
