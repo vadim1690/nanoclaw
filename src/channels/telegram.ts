@@ -45,6 +45,24 @@ export function keepCommandsAsMessages(adapter: ReturnType<typeof createTelegram
 }
 
 /**
+ * Send formatted posts as plain `sendMessage` + MarkdownV2 entities instead of
+ * Bot API Rich Messages. Adapters >= 4.41 route every markdown post/edit through
+ * `sendRichMessage`, which Telegram for Android renders badly for RTL text
+ * (bullets on the left, ragged right edge, blank space under blocks):
+ * https://bugs.telegram.org/c/62877. The adapter has no option for this, only
+ * the internal `richMessagesAvailable` flag it clears itself when the Bot API
+ * rejects rich messages. telegram-rich-messages.test.ts goes red if it moves.
+ */
+export function disableRichMessages(adapter: ReturnType<typeof createTelegramAdapter>): void {
+  const a = adapter as unknown as { richMessagesAvailable?: unknown };
+  if (typeof a.richMessagesAvailable !== 'boolean') {
+    log.warn('Telegram adapter has no richMessagesAvailable flag; rich messages may still be sent');
+    return;
+  }
+  a.richMessagesAvailable = false;
+}
+
+/**
  * Retry a one-shot operation that can fail on transient network errors at
  * cold-start (DNS hiccups, brief upstream outages). Exponential backoff capped
  * at 5 attempts — if the network is truly down we surface it instead of
@@ -391,6 +409,7 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     mode: 'polling',
   });
   keepCommandsAsMessages(telegramAdapter);
+  disableRichMessages(telegramAdapter);
   const bridge = createChatSdkBridge({
     adapter: telegramAdapter,
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
