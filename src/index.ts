@@ -25,6 +25,7 @@ import { startGatewayAvailabilityMonitor } from './gateway-availability.js';
 import { getGatewayProvider } from './gateway-providers/index.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { installRtlLayout } from './channels/telegram-rtl.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
 // Response registry lives in response-registry.ts to break the
@@ -55,6 +56,9 @@ import {
   teardownChannelAdapters,
   createChannelDeliveryAdapter,
 } from './channels/channel-registry.js';
+
+// Hebrew right-to-left layout for Telegram (local customization).
+installRtlLayout();
 
 let stopGatewayAvailabilityMonitor: (() => void) | undefined;
 

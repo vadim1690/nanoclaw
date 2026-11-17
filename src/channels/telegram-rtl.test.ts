@@ -6,7 +6,7 @@
 import { createTelegramAdapter } from '@chat-adapter/telegram';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { addLineRlm, applyRtlLayout, isRtlText, withRtlLayout } from './telegram.js';
+import { addLineRlm, applyRtlLayout, isRtlText, withRtlLayout } from './telegram-rtl.js';
 
 const RLM = '\u200F';
 const CHAT_ID = 12345;
