@@ -1463,3 +1463,102 @@ describe('describeResolvedRule', () => {
     );
   });
 });
+
+describe('auto-connect by group name (fork)', () => {
+  async function useAutoConnect(opts: { owner?: boolean } = {}) {
+    const { registerChannelCardInterceptor } = await import('./channel-approval.js');
+    const { autoConnectByName } = await import('./auto-connect.js');
+    registerChannelCardInterceptor('slack', autoConnectByName);
+    if (opts.owner !== false) {
+      await upsertUser({ id: 'slack:U_ALICE', kind: 'slack', display_name: 'Alice', created_at: now() });
+      await grantRole({
+        user_id: 'slack:U_ALICE',
+        role: 'owner',
+        agent_group_id: null,
+        granted_by: null,
+        granted_at: now(),
+      });
+    }
+  }
+  const wiringsOf = (agentGroupId: string) =>
+    countRows('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE agent_group_id = ?', agentGroupId);
+
+  it("connects an owner's new group named like an unwired agent, without a card", async () => {
+    await useAutoConnect();
+    resolveConversationMock.mockResolvedValue({ type: 'channel', name: '  andy ' });
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(slackGroupMention('C-andy'));
+
+    await vi.waitFor(async () => expect(await wiringsOf('ag-1')).toBe(1));
+    const mga = (await getDb().get(
+      'SELECT engage_mode, sender_scope, messaging_group_id FROM messaging_group_agents WHERE agent_group_id = ?',
+      'ag-1',
+    )) as { engage_mode: string; sender_scope: string; messaging_group_id: string };
+    expect(mga.engage_mode).toBe('mention-sticky'); // the channel's declared group default, like an approved card
+    expect(mga.sender_scope).toBe('known');
+    const member = await getDb().get(
+      'SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?',
+      'slack:U_ALICE',
+      'ag-1',
+    );
+    expect(member).toBeDefined();
+    expect(await countRows('SELECT COUNT(*) AS c FROM pending_channel_approvals')).toBe(0);
+    expect(deliverMock).not.toHaveBeenCalled();
+  });
+
+  it('sends the normal card when the sender is not an owner', async () => {
+    await useAutoConnect({ owner: false });
+    resolveConversationMock.mockResolvedValue({ type: 'channel', name: 'Andy' });
+    const { routeInbound } = await import('../../router.js');
+    await expectAsyncDelivery(() => routeInbound(slackGroupMention('C-not-owner')));
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(await wiringsOf('ag-1')).toBe(0);
+  });
+
+  it('sends the normal card when the matching agent already has a chat', async () => {
+    await useAutoConnect();
+    const { createMessagingGroupAgent } = await import('../../db/messaging-groups.js');
+    await createMessagingGroup({
+      id: 'mg-existing',
+      channel_type: 'telegram',
+      platform_id: 'existing-chat',
+      name: 'Existing',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-existing',
+      messaging_group_id: 'mg-existing',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'known',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+    resolveConversationMock.mockResolvedValue({ type: 'channel', name: 'Andy' });
+    const { routeInbound } = await import('../../router.js');
+    await expectAsyncDelivery(() => routeInbound(slackGroupMention('C-steal')));
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(await wiringsOf('ag-1')).toBe(1); // only the original chat
+  });
+
+  it('sends the normal card when no agent or more than one agent matches the title', async () => {
+    await useAutoConnect();
+    const { routeInbound } = await import('../../router.js');
+    resolveConversationMock.mockResolvedValue({ type: 'channel', name: 'Nobody' });
+    await expectAsyncDelivery(() => routeInbound(slackGroupMention('C-nobody')));
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+
+    deliverMock.mockClear();
+    await createAgentGroup({ id: 'ag-2', name: 'andy', folder: 'other', agent_provider: null, created_at: now() });
+    resolveConversationMock.mockResolvedValue({ type: 'channel', name: 'Andy' }); // ag-1 by folder, ag-2 by name
+    await expectAsyncDelivery(() => routeInbound(slackGroupMention('C-ambiguous')));
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(await wiringsOf('ag-1')).toBe(0);
+    expect(await wiringsOf('ag-2')).toBe(0);
+  });
+});

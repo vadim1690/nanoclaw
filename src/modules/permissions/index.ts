@@ -61,6 +61,8 @@ import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
 import { ensureUserDm } from './user-dm.js';
+// Fork: connect an owner's new group to a new agent by name, without the card.
+import './auto-connect.js';
 
 // ── Free-text name input state ──
 // Tracks approvers waiting for a text reply with the agent name. Keyed by
