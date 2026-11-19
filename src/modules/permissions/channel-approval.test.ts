@@ -277,6 +277,40 @@ function slackGroupMention(platformId: string) {
 }
 
 describe('unknown-channel registration flow', () => {
+  it('sends the card to the owner, never to a scoped admin of the first agent group', async () => {
+    // A household member who admins only agent ag-1 (and has a DM) must not be asked to wire a new chat.
+    await upsertUser({ id: 'telegram:member', kind: 'telegram', display_name: 'Member', created_at: now() });
+    await grantRole({
+      user_id: 'telegram:member',
+      role: 'admin',
+      agent_group_id: 'ag-1',
+      granted_by: 'telegram:owner',
+      granted_at: now(),
+    });
+    await createMessagingGroup({
+      id: 'mg-dm-member',
+      channel_type: 'telegram',
+      platform_id: 'dm-member',
+      name: 'Member DM',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    await getDb().run(
+      `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`,
+      'telegram:member',
+      'telegram',
+      'mg-dm-member',
+      now(),
+    );
+
+    const { routeInbound } = await import('../../router.js');
+    await expectAsyncDelivery(() => routeInbound(groupMention('chat-scoped-admin')));
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(deliverMock.mock.calls[0][1]).toBe('dm-owner');
+  });
+
   it('delivers an approval card on mention into an unwired group', async () => {
     const { routeInbound } = await import('../../router.js');
     await expectAsyncDelivery(() => routeInbound(groupMention('chat-new')));
@@ -759,9 +793,8 @@ describe('unknown-channel registration flow', () => {
     expect(outcome).toBe('accepted');
   });
 
-  it('does not let a scoped admin connect an unknown channel to another agent group', async () => {
+  it('does not ask a scoped admin about an unknown channel, and their click connects nothing (fork)', async () => {
     const { routeInbound } = await import('../../router.js');
-    const { getResponseHandlers } = await import('../../response-registry.js');
 
     await createAgentGroup({ id: 'ag-2', name: 'Betty', folder: 'betty', agent_provider: null, created_at: now() });
     await upsertUser({
@@ -802,28 +835,10 @@ describe('unknown-channel registration flow', () => {
     ))!;
     expect(pending).toBeDefined();
     expect(deliverMock).toHaveBeenCalledTimes(1);
-    expect(deliverMock.mock.calls[0][1]).toBe('dm-scoped-admin');
+    // Fork policy: the card goes to the owner, never to an admin scoped to one agent group.
+    expect(deliverMock.mock.calls[0][1]).toBe('dm-owner');
 
-    for (const handler of getResponseHandlers()) {
-      const claimed = await handler({
-        questionId: pending.messaging_group_id,
-        value: 'choose_existing',
-        userId: 'scoped-admin',
-        channelType: 'telegram',
-        platformId: 'dm-scoped-admin',
-        threadId: null,
-      });
-      if (claimed) break;
-    }
-
-    const followupPayload = JSON.parse(deliverMock.mock.calls[1][4] as string) as {
-      question: string;
-      options: Array<{ label: string; value: string }>;
-    };
-    expect(followupPayload.question).toContain(AGENT_ACCESS_SCOPE_WARNING);
-    expect(followupPayload.options.map((option) => option.value)).toContain('connect:ag-1');
-    expect(followupPayload.options.map((option) => option.value)).not.toContain('connect:ag-2');
-
+    // Even if the scoped admin answers the owner's card, nothing is connected.
     const { dispatchResponse } = await import('../../response-registry.js');
     const outcome = await dispatchResponse({
       questionId: pending.messaging_group_id,
@@ -833,8 +848,7 @@ describe('unknown-channel registration flow', () => {
       platformId: 'dm-scoped-admin',
       threadId: null,
     });
-    expect(outcome).toBe('refused');
-
+    expect(outcome).not.toBe('accepted');
     const mgaCount = await countRows(
       'SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ?',
       pending.messaging_group_id,

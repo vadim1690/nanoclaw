@@ -269,11 +269,14 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     });
     return;
   }
-  // Use first agent group for approver resolution — owners and global admins
-  // are returned regardless of which group we pass.
+  // The first agent group only labels the card. An unknown channel belongs to
+  // no agent yet, so only owners and global admins may wire it. Passing the
+  // group to pickApprover put its scoped admins first, so someone who admins a
+  // single agent was asked to connect a new chat to any agent (fork fix,
+  // 19.11.2026).
   const referenceGroup = agentGroups[0];
 
-  const approvers = await pickApprover(referenceGroup.id);
+  const approvers = await pickApprover(null);
   if (approvers.length === 0) {
     log.warn('Channel registration skipped — no owner or admin configured', {
       messagingGroupId,
