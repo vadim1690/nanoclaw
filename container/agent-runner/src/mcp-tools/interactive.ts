@@ -1,14 +1,19 @@
 /**
  * Interactive MCP tools: ask_user_question, send_card.
  *
- * ask_user_question is a blocking tool call — it writes a messages_out row
- * with a question card, then polls messages_in for the response.
+ * ask_user_question writes a messages_out row with a question card. By default
+ * it then polls messages_in for the response (a blocking call); with
+ * `wait: false` it returns once the card is up, and the answer reaches the
+ * agent later as a message (late-answers.ts). A tap after a blocking call
+ * timed out arrives the same way.
  */
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 import { setTimeout as sleep } from 'node:timers/promises';
 
+import { findByName, getAllDestinations } from '../destinations.js';
 import { findQuestionResponse, markCompleted } from '../db/messages-in.js';
 import { getDeliveryStatus, writeMessageOut } from '../db/messages-out.js';
+import { forgetQuestion, rememberQuestion, stopWaiting } from '../db/questions.js';
 import { getSessionRouting, resolveDestinationThread } from '../db/session-routing.js';
 import { getCurrentReplyRoute } from '../db/session-state.js';
 import { cardProblems } from './card-parts.js';
@@ -36,6 +41,51 @@ function routing() {
       : null;
   return { ...session, thread_id: thread?.threadId ?? session.thread_id };
 }
+
+/**
+ * Where a question card goes: the named chat destination, else this
+ * session's chat. A task run has no chat of its own, so it must name one.
+ */
+function questionRoute(
+  to: unknown,
+): { platform_id: string; channel_type: string; thread_id: string | null } | { error: string } {
+  const chats = () =>
+    getAllDestinations()
+      .filter((d) => d.type === 'channel')
+      .map((d) => d.name)
+      .join(', ') || '(none)';
+  if (typeof to === 'string' && to) {
+    const dest = findByName(to);
+    if (!dest) return { error: `Unknown destination "${to}". Chats: ${chats()}` };
+    if (dest.type !== 'channel' || !dest.channelType || !dest.platformId) {
+      return { error: `"${to}" is not a chat. A question card needs a chat destination: ${chats()}` };
+    }
+    const thread = resolveDestinationThread(dest.channelType, dest.platformId, getCurrentReplyRoute());
+    return { platform_id: dest.platformId, channel_type: dest.channelType, thread_id: thread?.threadId ?? null };
+  }
+  const r = routing();
+  if (!r.channel_type || !r.platform_id) {
+    return { error: `This conversation has no chat to show the card in (a task run, for one). Pass to: ${chats()}` };
+  }
+  return { platform_id: r.platform_id, channel_type: r.channel_type, thread_id: r.thread_id };
+}
+
+/**
+ * Telegram draws some button labels left to right (a label that opens with an
+ * emoji or a Latin word), so a label with Hebrew or Arabic letters is wrapped
+ * in a right-to-left isolate (U+2067 … U+2069). Only the button text changes:
+ * the option's value, which the agent gets back, stays as written.
+ */
+const RLI = String.fromCharCode(0x2067);
+const PDI = String.fromCharCode(0x2069);
+const RTL_LETTER = /[\p{Script=Hebrew}\p{Script=Arabic}]/u;
+
+export function rtlLabel(label: string): string {
+  return RTL_LETTER.test(label) && !label.startsWith(RLI) ? `${RLI}${label}${PDI}` : label;
+}
+
+/** How long `wait: false` waits for the host to post the card, so a card it could not post is still reported. */
+export const POST_CONFIRM_MS = 10_000;
 
 /**
  * The one definition of a send_card action: send_card is fire-and-forget, so
@@ -159,7 +209,7 @@ export const askUserQuestion: McpToolDefinition = {
   tool: {
     name: 'ask_user_question',
     description:
-      'Ask the user a multiple-choice question and wait for their response. This is a blocking call — execution pauses until the user responds or the timeout expires. Provide a short card title (e.g. "Confirm deletion") and an array of options — each option may be a plain string (used as both button label and result value) or an object { label, selectedLabel?, value? } where selectedLabel is the text shown on the card after the user clicks.',
+      'Ask the user a multiple-choice question with buttons. By default this is a blocking call: execution pauses until the user responds or the timeout expires. With wait: false it returns as soon as the card is posted, and the answer reaches you later as a new message starting with [כפתור] (so does a tap after a timeout). Provide a short card title (e.g. "Confirm deletion") and an array of options — each option may be a plain string (used as both button label and result value) or an object { label, selectedLabel?, value? } where selectedLabel is the text shown on the card after the user clicks.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -187,6 +237,15 @@ export const askUserQuestion: McpToolDefinition = {
           description: 'Options for the user to choose from (string or {label, selectedLabel?, value?})',
         },
         timeout: { type: 'number', description: 'Timeout in seconds (default: 300)' },
+        wait: {
+          type: 'boolean',
+          description:
+            'Default true: wait for the answer (or the timeout). false: return once the card is posted; the answer arrives later as a message starting with [כפתור].',
+        },
+        to: {
+          type: 'string',
+          description: "Chat destination for the card. Default: this conversation's chat. Required in a task run.",
+        },
       },
       required: ['title', 'question', 'options'],
     },
@@ -197,6 +256,7 @@ export const askUserQuestion: McpToolDefinition = {
     const question = args.question as string;
     const rawOptions = args.options as unknown[];
     const timeout = ((args.timeout as number) || 300) * 1000;
+    const wait = args.wait !== false;
     if (!title || !question || !rawOptions?.length) {
       return err('title, question, and options are required');
     }
@@ -206,6 +266,8 @@ export const askUserQuestion: McpToolDefinition = {
         `title and question are too long to show in full on a card (${title.length + question.length} characters, limit ${MAX_CARD_QUESTION_LENGTH}). Shorten the question.`,
       );
     }
+    const r = questionRoute(args.to);
+    if ('error' in r) return err(r.error);
 
     const options = rawOptions.map((o) => {
       if (typeof o === 'string') return { label: o, selectedLabel: o, value: o };
@@ -216,9 +278,19 @@ export const askUserQuestion: McpToolDefinition = {
         value: obj.value ?? obj.label,
       };
     });
+    const buttons =
+      r.channel_type === 'telegram'
+        ? options.map((o) => ({ ...o, label: rtlLabel(o.label), selectedLabel: rtlLabel(o.selectedLabel) }))
+        : options;
 
     const questionId = generateId();
-    const r = routing();
+    // Recorded before the card exists, so no answer can arrive unclaimed.
+    rememberQuestion(questionId, {
+      title,
+      question,
+      options: options.map(({ label, value }) => ({ label, value })),
+      waitingUntil: wait ? Date.now() + timeout : null,
+    });
 
     // Write question card to outbound.db
     await writeMessageOut({
@@ -232,50 +304,90 @@ export const askUserQuestion: McpToolDefinition = {
         questionId,
         title,
         question,
-        options,
+        options: buttons,
       }),
     });
 
-    log(`ask_user_question: ${questionId} → "${question}" [${options.join(', ')}]`);
+    log(`ask_user_question: ${questionId} → "${question}" [${options.map((o) => o.value).join(', ')}]`);
 
-    // Poll for response in inbound.db (host writes the response there)
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      if (context?.signal.aborted) return err('Question cancelled');
-      // Read the delivery outcome before the answer, so an answer that lands
-      // between the two reads still wins.
-      const deliveryFailed = getDeliveryStatus(questionId) === 'failed';
-      const response = findQuestionResponse(questionId);
+    if (!wait) return confirmPosted(questionId, context?.signal);
 
-      if (response) {
-        const parsed = JSON.parse(response.content);
-        // Mark the response as completed via processing_ack (outbound.db)
-        markCompleted([response.id]);
-
-        log(`ask_user_question response: ${questionId} → ${parsed.selectedOption}`);
-        return ok(parsed.selectedOption);
-      }
-
-      // The host gave up delivering the card: stop waiting for an answer.
-      if (deliveryFailed) {
-        log(`ask_user_question undeliverable: ${questionId}`);
-        return err(
-          'The question card could not be delivered, so no answer will be collected. Shorten the title, question or option labels, or ask in a plain message.',
-        );
-      }
-
-      try {
-        await sleep(1000, undefined, { signal: context?.signal });
-      } catch (error) {
+    try {
+      // Poll for response in inbound.db (host writes the response there)
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
         if (context?.signal.aborted) return err('Question cancelled');
-        throw error;
-      }
-    }
+        // Read the delivery outcome before the answer, so an answer that lands
+        // between the two reads still wins.
+        const deliveryFailed = getDeliveryStatus(questionId) === 'failed';
+        const response = findQuestionResponse(questionId);
 
-    log(`ask_user_question timeout: ${questionId}`);
-    return err(`Question timed out after ${timeout / 1000}s`);
+        if (response) {
+          const parsed = JSON.parse(response.content);
+          // Mark the response as completed via processing_ack (outbound.db),
+          // then drop the question: the poll loop never delivers it again.
+          markCompleted([response.id]);
+          forgetQuestion(questionId);
+
+          log(`ask_user_question response: ${questionId} → ${parsed.selectedOption}`);
+          return ok(parsed.selectedOption);
+        }
+
+        // The host gave up delivering the card: stop waiting for an answer.
+        if (deliveryFailed) {
+          log(`ask_user_question undeliverable: ${questionId}`);
+          forgetQuestion(questionId);
+          return err(UNDELIVERABLE);
+        }
+
+        try {
+          await sleep(1000, undefined, { signal: context?.signal });
+        } catch (error) {
+          if (context?.signal.aborted) return err('Question cancelled');
+          throw error;
+        }
+      }
+
+      log(`ask_user_question timeout: ${questionId}`);
+      return err(
+        `Question timed out after ${timeout / 1000}s. The card stays up: if the user taps an option later, it reaches you as a new message starting with [כפתור].`,
+      );
+    } finally {
+      // Timed out, cancelled or answered: any later answer is the poll loop's to deliver.
+      stopWaiting(questionId);
+    }
   },
 };
+
+const UNDELIVERABLE =
+  'The question card could not be delivered, so no answer will be collected. Shorten the title, question or option labels, or ask in a plain message.';
+
+/**
+ * `wait: false`: give the host a moment to post the card, so a card it could
+ * not post is reported like the blocking call reports it. Returns as soon as
+ * the outcome is known.
+ */
+async function confirmPosted(questionId: string, signal?: AbortSignal) {
+  const later = 'When the user taps an option, it reaches you as a new message starting with [כפתור]; act on it then.';
+  const deadline = Date.now() + POST_CONFIRM_MS;
+  while (Date.now() < deadline && !signal?.aborted) {
+    const status = getDeliveryStatus(questionId);
+    if (status === 'failed') {
+      log(`ask_user_question undeliverable: ${questionId}`);
+      forgetQuestion(questionId);
+      return err(UNDELIVERABLE);
+    }
+    if (status === 'delivered') return ok(`Question posted (id: ${questionId}). Not waiting for the answer. ${later}`);
+    try {
+      await sleep(250, undefined, { signal });
+    } catch {
+      break;
+    }
+  }
+  return ok(
+    `Question sent (id: ${questionId}); the chat has not confirmed it yet. Not waiting for the answer. ${later}`,
+  );
+}
 
 export const sendCard: McpToolDefinition = {
   tool: {

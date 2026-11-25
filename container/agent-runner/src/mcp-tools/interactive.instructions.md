@@ -4,7 +4,9 @@ The two tools here solve different problems: `ask_user_question` forces a decisi
 
 ### Asking a multiple-choice question (`ask_user_question`)
 
-`mcp__nanoclaw__ask_user_question({ title, question, options, timeout? })` presents the user with a set of choices and **blocks your turn** until they tap one or the timeout expires (default: 300 seconds). Returns their chosen value.
+`mcp__nanoclaw__ask_user_question({ title, question, options, timeout?, wait?, to? })` presents the user with a set of choices and **blocks your turn** until they tap one or the timeout expires (default: 300 seconds). Returns their chosen value.
+
+With `wait: false` the tool returns as soon as the card is posted, and your turn goes on. When the user taps, even hours later, the answer reaches you as a new message: `[כפתור] נבחר «<option>» בשאלה «<title — question>»`. Act on it then. A tap after a blocking call timed out arrives the same way. Use `wait: false` whenever the answer can come later, and always in a task run. A task run has no chat of its own: pass `to` with the chat destination (the same name you give `send_message`).
 
 `options` can be plain strings or `{ label, selectedLabel?, value? }` objects:
 - `label` — the button text shown before selection

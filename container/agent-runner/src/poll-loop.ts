@@ -31,6 +31,7 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
+import { inboundForAgent } from './late-answers.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 import type { ProviderRuntimeContract } from './provider-contracts/registry.js';
@@ -126,8 +127,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   let isFirstPoll = true;
   while (true) {
     if (config.signal?.aborted) return;
-    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question),
+    // except a question answer no blocking call is waiting for: that one becomes a message.
+    const messages = inboundForAgent(getPendingMessages(isFirstPoll));
     isFirstPoll = false;
     pollCount++;
 
@@ -489,7 +491,9 @@ export async function processQuery(
           return;
         }
 
-        // Skip system messages (MCP tool responses).
+        // Skip system messages (MCP tool responses), except a question answer
+        // no blocking call is waiting for (late-answers.ts). Converted only
+        // after the command check above, which leaves the rows pending.
         // Thread routing is the router's concern — if a message landed in this
         // session, the agent should see it. Per-thread sessions already isolate
         // threads into separate containers; shared sessions intentionally merge
@@ -502,8 +506,9 @@ export async function processQuery(
         // follow-up is also pending; otherwise they stay pending for a future
         // batch (mirrors the two-phase initial-batch selection in
         // db/messages-in.ts).
-        const hasFollowUpTrigger = pending.some((m) => m.kind !== 'system' && m.trigger === 1);
-        const newMessages = pending.filter((m) => m.kind !== 'system' && (m.trigger === 1 || hasFollowUpTrigger));
+        const visible = inboundForAgent(pending);
+        const hasFollowUpTrigger = visible.some((m) => m.trigger === 1);
+        const newMessages = visible.filter((m) => m.trigger === 1 || hasFollowUpTrigger);
         if (newMessages.length === 0) return;
 
         // Accumulated context must not engage a warm query by itself.

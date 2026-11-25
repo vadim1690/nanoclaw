@@ -3,9 +3,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { closeSessionDb, getInboundDb, getOutboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { findQuestionResponse } from '../db/messages-in.js';
-import { askUserQuestion, LINK_ACTION_SCHEMA, MAX_CARD_QUESTION_LENGTH, sendCard } from './interactive.js';
+import { getAskedQuestion } from '../db/questions.js';
+import { askUserQuestion, LINK_ACTION_SCHEMA, MAX_CARD_QUESTION_LENGTH, rtlLabel, sendCard } from './interactive.js';
 
-beforeEach(() => initTestSessionDb());
+beforeEach(() => {
+  initTestSessionDb();
+  // A question card needs a chat: the session's own, unless a test names another.
+  seedBoundThread('slack', 'C123', null);
+});
 afterEach(() => closeSessionDb());
 
 describe('ask_user_question cancellation', () => {
@@ -113,6 +118,116 @@ describe('ask_user_question — card the host could not post', () => {
     const result = await waiting;
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toBe('yes');
+  });
+});
+
+describe('ask_user_question — wait: false', () => {
+  const args = { title: 'Fixture', question: 'Choose', options: ['yes', 'no'], wait: false };
+
+  it('returns as soon as the card is posted, without waiting for an answer', async () => {
+    const asking = askUserQuestion.handler(args);
+    const questionId = await postedQuestionId();
+    const started = Date.now();
+    recordDelivery(questionId, 'delivered');
+    const result = await asking;
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('Not waiting for the answer');
+    expect(result.content[0].text).toContain('[כפתור]');
+    // Kept for the poll loop, with no call waiting.
+    expect(getAskedQuestion(questionId)).toEqual({
+      title: 'Fixture',
+      question: 'Choose',
+      options: [
+        { label: 'yes', value: 'yes' },
+        { label: 'no', value: 'no' },
+      ],
+      waitingUntil: null,
+    });
+  });
+
+  it('still reports a card the host could not post', async () => {
+    const asking = askUserQuestion.handler(args);
+    const questionId = await postedQuestionId();
+    recordDelivery(questionId, 'failed');
+    const result = await asking;
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('could not be delivered');
+    expect(getAskedQuestion(questionId)).toBeUndefined();
+  });
+
+  it('keeps the size check', async () => {
+    const result = await askUserQuestion.handler({ ...args, question: 'x'.repeat(MAX_CARD_QUESTION_LENGTH) });
+    expect(result.content[0].text).toContain('too long to show in full');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+});
+
+describe('ask_user_question — where the card goes', () => {
+  function seedChat(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+
+  it('refuses, naming the chats, when the session has no chat and no `to` (a task run)', async () => {
+    seedBoundThread(null, null, 'system:tasks:t1');
+    seedChat('dm', 'telegram', 'telegram:1');
+    const result = await askUserQuestion.handler({ title: 'T', question: 'Q', options: ['a'], wait: false });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Pass to: dm');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('posts to the chat named in `to`', async () => {
+    seedBoundThread(null, null, 'system:tasks:t1');
+    seedChat('dm', 'telegram', 'telegram:1');
+    const asking = askUserQuestion.handler({ title: 'T', question: 'Q', options: ['a'], wait: false, to: 'dm' });
+    const questionId = await postedQuestionId();
+    recordDelivery(questionId, 'delivered');
+    await asking;
+    const [card] = getUndeliveredMessages();
+    expect([card.channel_type, card.platform_id]).toEqual(['telegram', 'telegram:1']);
+  });
+
+  it('refuses an unknown destination', async () => {
+    const result = await askUserQuestion.handler({ title: 'T', question: 'Q', options: ['a'], to: 'nobody' });
+    expect(result.content[0].text).toContain('Unknown destination "nobody"');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('wraps Hebrew button labels in a right-to-left isolate on Telegram, and returns the plain value', async () => {
+    seedBoundThread('telegram', 'telegram:1', null);
+    const asking = askUserQuestion.handler({ title: 'T', question: 'Q', options: ['⭐ כחול', 'Plain'], timeout: 10 });
+    const questionId = await postedQuestionId();
+    const options = JSON.parse(getUndeliveredMessages()[0].content).options;
+    expect(options[0]).toEqual({ label: rtlLabel('⭐ כחול'), selectedLabel: rtlLabel('⭐ כחול'), value: '⭐ כחול' });
+    expect(options[0].label).toBe(`${String.fromCharCode(0x2067)}⭐ כחול${String.fromCharCode(0x2069)}`);
+    expect(options[1]).toEqual({ label: 'Plain', selectedLabel: 'Plain', value: 'Plain' });
+    answerQuestion(questionId, null, '⭐ כחול');
+    expect((await asking).content[0].text).toBe('⭐ כחול');
+  });
+});
+
+describe('ask_user_question — a blocking call that ends', () => {
+  it('leaves a timed-out question for the poll loop, saying a later tap still arrives', async () => {
+    const result = await askUserQuestion.handler({ title: 'T', question: 'Q', options: ['a'], timeout: 1 });
+    expect(result.content[0].text).toContain('timed out after 1s');
+    expect(result.content[0].text).toContain('reaches you as a new message starting with [כפתור]');
+    const questionId = JSON.parse(getUndeliveredMessages()[0].content).questionId;
+    expect(getAskedQuestion(questionId)?.waitingUntil).toBeNull();
+  });
+
+  it('forgets a question once it has its answer', async () => {
+    const asking = askUserQuestion.handler({ title: 'T', question: 'Q', options: ['yes'], timeout: 10 });
+    const questionId = await postedQuestionId();
+    expect(getAskedQuestion(questionId)?.waitingUntil).toBeGreaterThan(Date.now());
+    answerQuestion(questionId, null);
+    expect((await asking).content[0].text).toBe('yes');
+    expect(getAskedQuestion(questionId)).toBeUndefined();
   });
 });
 
@@ -363,12 +478,34 @@ describe('send_card — card parts', () => {
       { type: 'Fields', children: [{ type: 'Button', props: { id: 'ncq:q-1:0', label: 'x' } }] },
       'Fields holds only Field parts',
     ],
-    ['a field named after an object method', { type: 'Fields', children: [{ type: 'constructor' }] }, 'Fields holds only Field parts'],
+    [
+      'a field named after an object method',
+      { type: 'Fields', children: [{ type: 'constructor' }] },
+      'Fields holds only Field parts',
+    ],
     ['a short table row', table([['1x', '40']]), 'row 0 has 2 cells, expected 3'],
     ['a table of 31 rows', table(Array.from({ length: 31 }, () => ['1x', '40', '38'])), 'at most 30 rows'],
-    ['an align list longer than the headers', { type: 'Table', props: { headers: ['a'], rows: [['1']], align: ['left', 'right'] } }, 'one per column'],
-    ['a pie with a repeated slice label', chart('Split', { type: 'pie', segments: [{ label: 'a', value: 1 }, { label: 'a', value: 2 }] }), 'must not repeat'],
-    ['a table of 7 columns', table([['a', 'b', 'c', 'd', 'e', 'f', 'g']], ['1', '2', '3', '4', '5', '6', '7']), 'at most 6 columns'],
+    [
+      'an align list longer than the headers',
+      { type: 'Table', props: { headers: ['a'], rows: [['1']], align: ['left', 'right'] } },
+      'one per column',
+    ],
+    [
+      'a pie with a repeated slice label',
+      chart('Split', {
+        type: 'pie',
+        segments: [
+          { label: 'a', value: 1 },
+          { label: 'a', value: 2 },
+        ],
+      }),
+      'must not repeat',
+    ],
+    [
+      'a table of 7 columns',
+      table([['a', 'b', 'c', 'd', 'e', 'f', 'g']], ['1', '2', '3', '4', '5', '6', '7']),
+      'at most 6 columns',
+    ],
     [
       'a series missing a value',
       chart('Latency', { type: 'line', categories: ['1x', '2x'], series: [{ name: 'Before', values: [40] }] }),
@@ -376,22 +513,46 @@ describe('send_card — card parts', () => {
     ],
     ['a pie slice of zero', pie(0), 'segments[0].value'],
     ['a table too long for Slack to draw', table([['x'.repeat(10_000), 'a', 'b']]), 'at most 10000'],
-    ['a table given as object rows', { type: 'Table', props: { headers: ['Evidence'], rows: [{ Evidence: 'x' }] } }, 'row 0 must be a list of cells'],
-    ['a table with no text', { type: 'Table', props: { headers: [' '], rows: [[' ']] } }, 'the table has no text in its headers or cells'],
+    [
+      'a table given as object rows',
+      { type: 'Table', props: { headers: ['Evidence'], rows: [{ Evidence: 'x' }] } },
+      'row 0 must be a list of cells',
+    ],
+    [
+      'a table with no text',
+      { type: 'Table', props: { headers: [' '], rows: [[' ']] } },
+      'the table has no text in its headers or cells',
+    ],
     [
       'a table cell given as a template',
       { type: 'Table', props: { headers: ['Evidence'], rows: [[{ $template: 'x' }]] } },
       'a cell must be text or a number',
     ],
-    ['a text part over 2,500 characters', { type: 'Text', props: { content: 'x'.repeat(2_501) } }, 'at most 2500 characters'],
-    ['a text part with an unknown style', { type: 'Text', props: { content: 'x', style: 'huge' } }, 'plain, bold or muted'],
-    ['a field over 1,500 characters', { type: 'Fields', children: [field('p95', 'x'.repeat(1_500))] }, 'at most 1500 characters'],
+    [
+      'a text part over 2,500 characters',
+      { type: 'Text', props: { content: 'x'.repeat(2_501) } },
+      'at most 2500 characters',
+    ],
+    [
+      'a text part with an unknown style',
+      { type: 'Text', props: { content: 'x', style: 'huge' } },
+      'plain, bold or muted',
+    ],
+    [
+      'a field over 1,500 characters',
+      { type: 'Fields', children: [field('p95', 'x'.repeat(1_500))] },
+      'at most 1500 characters',
+    ],
     [
       'a chart value of Infinity, as JSON reads 1e400',
       chart('Latency', { type: 'bar', categories: ['1x'], series: [{ name: 'Before', values: [Infinity] }] }),
       'values must be numbers',
     ],
-    ['a field with no value', { type: 'Fields', children: [{ type: 'Field', props: { label: 'p95' } }] }, 'props.label and props.value'],
+    [
+      'a field with no value',
+      { type: 'Fields', children: [{ type: 'Field', props: { label: 'p95' } }] },
+      'props.label and props.value',
+    ],
     [
       'a table whose caption makes it too long',
       { type: 'Table', props: { headers: ['a'], rows: [['b']], caption: 'x'.repeat(10_000) } },
@@ -405,17 +566,30 @@ describe('send_card — card parts', () => {
     ],
     [
       'an axis label over 50 characters',
-      chart('Latency', { type: 'bar', categories: ['1x'], series: [{ name: 'Before', values: [1] }], xLabel: 'x'.repeat(51) }),
+      chart('Latency', {
+        type: 'bar',
+        categories: ['1x'],
+        series: [{ name: 'Before', values: [1] }],
+        xLabel: 'x'.repeat(51),
+      }),
       'axis labels',
     ],
     [
       'a chart of 21 categories',
-      chart('Latency', { type: 'line', categories: Array.from({ length: 21 }, (_, i) => `${i}`), series: [{ name: 'B', values: Array.from({ length: 21 }, () => 1) }] }),
+      chart('Latency', {
+        type: 'line',
+        categories: Array.from({ length: 21 }, (_, i) => `${i}`),
+        series: [{ name: 'B', values: Array.from({ length: 21 }, () => 1) }],
+      }),
       '1 to 20 categories',
     ],
     [
       'a chart of 13 series',
-      chart('Latency', { type: 'bar', categories: ['1x'], series: Array.from({ length: 13 }, (_, i) => ({ name: `s${i}`, values: [1] })) }),
+      chart('Latency', {
+        type: 'bar',
+        categories: ['1x'],
+        series: Array.from({ length: 13 }, (_, i) => ({ name: `s${i}`, values: [1] })),
+      }),
       '1 to 12 series',
     ],
     [
@@ -479,7 +653,6 @@ describe('send_card — card parts', () => {
     expect(charts.content[0].text).toContain('at most 2 Chart');
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
-
 });
 
 // ── Thread of the chat being answered ──
@@ -487,17 +660,15 @@ describe('send_card — card parts', () => {
 // message being answered, else the chat's latest inbound thread. The bound
 // thread in session_routing is null for every session that isn't per-thread.
 
-function seedBoundThread(channelType: string, platformId: string, threadId: string | null): void {
+function seedBoundThread(channelType: string | null, platformId: string | null, threadId: string | null): void {
   const db = getInboundDb();
   db.exec(`CREATE TABLE IF NOT EXISTS session_routing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     channel_type TEXT, platform_id TEXT, thread_id TEXT
   )`);
-  db.prepare('INSERT INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, ?, ?, ?)').run(
-    channelType,
-    platformId,
-    threadId,
-  );
+  db.prepare(
+    'INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, ?, ?, ?)',
+  ).run(channelType, platformId, threadId);
 }
 
 let hostSeq = 0;
@@ -526,7 +697,7 @@ function publishReplyRoute(route: {
  * The user's click, as the host writes it into messages_in
  * (src/modules/interactive/index.ts): the card's own chat and thread.
  */
-function answerQuestion(questionId: string, threadId: string | null): void {
+function answerQuestion(questionId: string, threadId: string | null, selectedOption = 'yes'): void {
   hostSeq += 2;
   getInboundDb()
     .prepare(
@@ -538,7 +709,7 @@ function answerQuestion(questionId: string, threadId: string | null): void {
       hostSeq,
       new Date().toISOString(),
       threadId,
-      JSON.stringify({ questionId, selectedOption: 'yes' }),
+      JSON.stringify({ questionId, selectedOption }),
     );
 }
 
