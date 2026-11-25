@@ -12,14 +12,31 @@
  */
 import { getDb, hasTable } from '../../db/connection.js';
 import { isUniqueViolation } from '../../db/errors.js';
-import { deletePendingQuestion, getPendingQuestion, getSession } from '../../db/sessions.js';
+import { deletePendingQuestion, getPendingQuestion, getSession, updateSession } from '../../db/sessions.js';
 import { requestWake } from '../../request-wake.js';
 import { registerResponseHandler, type ResponseOutcome, type ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
+import type { Session } from '../../types.js';
 
 /** Questions whose answer is being written: of two clicks, only the first answers. */
 const answering = new Set<string>();
+
+/**
+ * Wake the session that asked, reopening it first if it was closed. A spent
+ * one-off task session is closed, and the host sweep reconciles only active
+ * sessions, so a container woken in a closed session was never reaped. Active
+ * again, its container is reaped after the idle ceiling and the sweep closes
+ * the session again once it is spent. A sweep tick between the reopen and the
+ * spawn sees the answer as a due message and wakes rather than closes.
+ */
+async function wakeForAnswer(session: Session): Promise<void> {
+  if (session.status !== 'active') {
+    await updateSession(session.id, { status: 'active' });
+    log.info('Reopened a closed session for a question answer', { sessionId: session.id });
+  }
+  await requestWake({ ...session, status: 'active' }, 'interactive');
+}
 
 async function handleInteractiveResponse(payload: ResponsePayload): Promise<ResponseOutcome | false> {
   if (!(await hasTable(getDb(), 'pending_questions'))) return false;
@@ -64,7 +81,7 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<Resp
         // delete or the activity stamp): close the card, and wake the agent.
         await deletePendingQuestion(payload.questionId);
         // Not awaited: a slow container start must not hold the card open.
-        void requestWake(session, 'interactive').catch((err: unknown) =>
+        void wakeForAnswer(session).catch((err: unknown) =>
           log.warn('Wake after a repeat question answer failed', { questionId: payload.questionId, err }),
         );
         return 'closed';
@@ -81,7 +98,7 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<Resp
       sessionId: session.id,
     });
 
-    await requestWake(session, 'interactive');
+    await wakeForAnswer(session);
     return 'accepted';
   } finally {
     answering.delete(payload.questionId);

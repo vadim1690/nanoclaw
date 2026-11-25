@@ -36,7 +36,7 @@ vi.mock('../../session-manager.js', async () => ({
 
 import { wakeContainer } from '../../container-runner.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { createPendingQuestion, createSession, getPendingQuestion } from '../../db/sessions.js';
+import { createPendingQuestion, createSession, getPendingQuestion, getSession } from '../../db/sessions.js';
 import { dispatchResponse, registerResponseHandler } from '../../response-registry.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import './index.js';
@@ -165,6 +165,44 @@ describe('question answers', () => {
     release();
     expect([await first, second]).toEqual(['accepted', 'accepted']);
     expect(approvalClicks).toHaveBeenCalledTimes(2);
+  });
+
+  it('reopens the closed task session that asked, so the sweep reaps its container again', async () => {
+    await createSession({
+      id: 'sess-task',
+      agent_group_id: 'ag-1',
+      messaging_group_id: null,
+      thread_id: 'system:tasks:t-1',
+      agent_provider: null,
+      status: 'closed',
+      container_status: 'stopped',
+      last_active: now(),
+      created_at: now(),
+    });
+    await createPendingQuestion({
+      question_id: 'q-task',
+      session_id: 'sess-task',
+      message_out_id: 'out-task',
+      platform_id: 'C1',
+      channel_type: 'slack',
+      thread_id: null,
+      title: 'Later',
+      options: [{ label: 'A', selectedLabel: 'A', value: 'a' }],
+      created_at: now(),
+    });
+    const outcome = await dispatchResponse({
+      questionId: 'q-task',
+      value: 'a',
+      userId: 'u',
+      channelType: 'slack',
+      platformId: 'C1',
+      threadId: null,
+    });
+    expect(outcome).toBe('accepted');
+    // 'accepted' is reported before the wake; the reopen comes just before it.
+    await vi.waitFor(() => expect(wakeContainer).toHaveBeenCalled());
+    expect((await getSession('sess-task'))?.status).toBe('active');
+    expect(vi.mocked(wakeContainer).mock.calls[0][0]).toMatchObject({ id: 'sess-task', status: 'active' });
   });
 
   it('reports the answer accepted before the agent is woken', async () => {
